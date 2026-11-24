@@ -1,21 +1,27 @@
 """Bambu Local MCP | Windows, Python 3.10+, Bambu Lab P1S/P2S
 
-Install Bambu Studio and put the bambu CLI v0.3.0 Windows executable on PATH
-or next to this file as bambu.exe:
-https://github.com/voska/bambu/releases/tag/v0.3.0
+Install Bambu Studio for background slicing. For cloud printing, sign in
+to Bambu Connect or Bambu Studio with the account you use in Bambu Handy:
+https://wiki.bambulab.com/en/software/bambu-connect
 
 Register the server with Codex:
     codex mcp add bambu-local -- python -X utf8 "<absolute path to server.py>"
 
-Put STL files in the prints directory next to this file, or set
-BAMBU_MCP_FILES to your preferred model directory. Use slice_stl and
-job_status to get a print package. Slicing needs no printer connection.
-Set BAMBU_STUDIO or BAMBU_CLI if those executables are installed elsewhere.
+Put STL or sliced .gcode.3mf files in the prints directory next to this
+file, or set BAMBU_MCP_FILES to your preferred model directory. Use
+slice_stl and job_status for slicing. Set BAMBU_STUDIO for custom installs.
 
-For LAN printing, enable the printer's LAN Only / Developer Mode where
-applicable. Use register_printer with its LAN address, serial and a local
-nickname. Save the LAN access code in the OS keychain using the CLI. In
-PowerShell 7, with the default MCP data directory:
+In the default cloud mode, prepare_cloud_print verifies the file without
+opening an app. After inspecting that the actual bed is clear, pass the
+returned SHA-256 and the same file to open_cloud_print. The tool opens
+the file in the official app. Select the account-bound printer, verify
+the plate is still clear and start the print in that app.
+
+For LAN printing, explicitly set BAMBU_MCP_MODE=lan. Install bambu CLI
+v0.3.0 on PATH or next to this file (or set BAMBU_CLI):
+https://github.com/voska/bambu/releases/tag/v0.3.0
+Use LAN Only / Developer Mode where applicable, register_printer, then
+save the LAN access code in the OS keychain. In PowerShell 7:
     (Read-Host 'LAN access code' -MaskInput) | bambu auth set <nickname> --config "$env:LOCALAPPDATA/BambuLocalMCP/printers.toml"
 
 Run printer_status and preflight before start_print. Print submission uses
@@ -37,7 +43,9 @@ import struct
 import subprocess
 import sys
 from typing import Any
+from urllib.parse import quote, urlencode
 from uuid import uuid4
+import winreg
 from xml.etree import ElementTree as ET
 from zipfile import BadZipFile, ZIP_DEFLATED, ZipFile
 
@@ -50,6 +58,11 @@ STUDIO = Path(os.environ.get(
     "BAMBU_STUDIO", Path(os.environ["ProgramFiles"]) / "Bambu Studio" / "bambu-studio.exe"
 )).resolve()
 CONFIG = STATE / "printers.toml"
+MODE = os.environ.get("BAMBU_MCP_MODE", "cloud").lower()
+if MODE not in {"cloud", "lan"}:
+    raise ValueError("BAMBU_MCP_MODE must be cloud or lan.")
+CONNECT_SCHEME = "bambu-connect"
+CONNECT_DOC = "https://wiki.bambulab.com/en/software/bambu-connect"
 MODELS = ("P1S", "P2S")
 PRESETS = {
     "P1S": ("0.20mm Standard @BBL X1C", "Bambu PLA Basic @BBL P1S 0.4 nozzle"),
@@ -182,6 +195,58 @@ def verify_package(path: Path) -> None:
                    if re.fullmatch(r"Metadata/plate_\d+\.gcode", name)]
         if len(payload) != 1 or archive.getinfo(payload[0]).file_size == 0 or archive.testzip() is not None:
             raise ValueError("The sliced package must have one valid print plate.")
+
+
+def cloud_status() -> dict:
+    try:
+        command = winreg.QueryValue(winreg.HKEY_CLASSES_ROOT, f"{CONNECT_SCHEME}\\shell\\open\\command")
+    except FileNotFoundError:
+        command = ""
+    connect_available = bool(command.strip())
+    studio_available = STUDIO.is_file()
+    app = "Bambu Connect" if connect_available else "Bambu Studio" if studio_available else None
+    return {"mode": "cloud", "app": app, "bambu_connect_installed": connect_available,
+            "bambu_studio_installed": studio_available, "account_check": "in_official_app",
+            "manual_start_required": True, "documentation": CONNECT_DOC}
+
+
+def cloud_package(value: str) -> tuple[Path, str]:
+    package = local_file(value, ".gcode.3mf")
+    verify_package(package)
+    with ZipFile(package) as archive:
+        config = json.loads(archive.read("Metadata/project_settings.config"))
+    model = next((model for model in MODELS
+                  if config.get("printer_settings_id") == f"Bambu Lab {model} 0.4 nozzle"), None)
+    if model is None:
+        raise ValueError("Use a sliced Bambu Studio package for the P1S or P2S with a 0.4 mm nozzle.")
+    return package, model
+
+
+def cloud_prepare(path: str) -> dict:
+    package, model = cloud_package(path)
+    return {**cloud_status(), "state": "prepared", "file": package.name, "model": model,
+            "sha256": digest(package), "bed_check_required": True, "print_started": False}
+
+
+def cloud_open(path: str, sha256: str, plate_clear: bool) -> dict:
+    if plate_clear is not True:
+        raise ValueError("Inspect the physical build plate for previous prints and debris before continuing.")
+    package, model = cloud_package(path)
+    if digest(package) != sha256:
+        raise ValueError("The print file does not match the SHA-256 from prepare_cloud_print.")
+    app = cloud_status()["app"]
+    if app == "Bambu Connect":
+        args = urlencode({"path": str(package), "name": package.name.removesuffix(".gcode.3mf"),
+                          "version": "1.0.0"}, quote_via=quote)
+        os.startfile(f"{CONNECT_SCHEME}://import-file?{args}")
+    elif app == "Bambu Studio":
+        subprocess.Popen([str(STUDIO), str(package)], cwd=STUDIO.parent,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        raise ValueError(f"Install Bambu Connect or Bambu Studio. {CONNECT_DOC}")
+    return {"state": "handed_off", "app": app, "model": model, "file": package.name,
+            "next": "Select the account-bound printer and verify its bed is clear before sending in the app.",
+            "print_started": False}
 
 
 def job_folder(kind: str) -> Path:
@@ -400,6 +465,22 @@ STRING = {"type": "string"}
 MODEL = {"type": "string", "enum": MODELS}
 PRINT = {"path": STRING, "printer": STRING, "ams_slot": STRING}
 TOOLS = {
+    "slice_stl": ("Queue a background Bambu Studio slice from a local STL. 0.4 mm Textured PEI, PLA Basic, 0.20 mm.",
+                  {"path": STRING, "model": MODEL, "rotate_z": {"type": "boolean"}}, ["path", "model"], slice_start),
+    "job_status": ("Read the current state of a background slice or print dispatch.",
+                   {"job_id": STRING}, ["job_id"], lambda job_id: data(find_job(job_id) / "state.json")),
+}
+CLOUD_TOOLS = {
+    "cloud_status": ("Detect the official app for Bambu account printing. The app shows account and printer status.",
+                     {}, [], cloud_status),
+    "prepare_cloud_print": ("Verify a sliced package locally. Does not open an app, send the file or start a print.",
+                            {"path": STRING}, ["path"], cloud_prepare),
+    "open_cloud_print": ("Open the verified package in the official app after checking the actual build plate. "
+                         "Requires manual print start in the app.",
+                         {"path": STRING, "sha256": STRING, "plate_clear": {"type": "boolean"}},
+                         ["path", "sha256", "plate_clear"], cloud_open),
+}
+LAN_TOOLS = {
     "discover_printers": ("Find Bambu printers announcing themselves on the LAN.", {}, [],
                           lambda: cli("printer", "discover", "--timeout", "10s")),
     "list_printers": ("List known printer settings; no access codes are returned.", {}, [],
@@ -409,15 +490,14 @@ TOOLS = {
                          ["name", "ip", "serial", "model"], printer_add),
     "printer_status": ("Read print state, loaded material and errors from the named device.",
                        {"printer": STRING}, ["printer"], lambda printer: cli("status", "--printer", printer)),
-    "slice_stl": ("Queue a background Bambu Studio slice from a local STL. 0.4 mm Textured PEI, PLA Basic, 0.20 mm.",
-                  {"path": STRING, "model": MODEL, "rotate_z": {"type": "boolean"}}, ["path", "model"], slice_start),
     "preflight": ("Check this sliced job against the live printer and AMS spool without sending a print.",
                   PRINT, list(PRINT), preflight),
     "start_print": ("Send the exact approved print file after checking a clear plate and live device preflight.",
                     {**PRINT, "plate_clear": {"type": "boolean"}}, [*PRINT, "plate_clear"], print_start),
-    "job_status": ("Read the current state of a background slice or print dispatch.",
-                   {"job_id": STRING}, ["job_id"], lambda job_id: data(find_job(job_id) / "state.json")),
 }
+TOOLS.update(CLOUD_TOOLS if MODE == "cloud" else LAN_TOOLS)
+READ_ONLY_TOOLS = {"cloud_status", "prepare_cloud_print", "discover_printers", "list_printers",
+                   "printer_status", "preflight", "job_status"}
 
 
 def text_result(body: Any, error: bool = False) -> dict:
@@ -430,7 +510,7 @@ def rpc(message: dict) -> dict:
     if name == "initialize":
         version = params.get("protocolVersion")
         return {"protocolVersion": version if version in VERSIONS else VERSIONS[0],
-                "serverInfo": {"name": "bambu-local", "version": "1.0.0"},
+                "serverInfo": {"name": "bambu-local", "version": "1.1.0"},
                 "capabilities": {"tools": {"listChanged": False}}}
     if name == "ping":
         return {}
@@ -438,8 +518,7 @@ def rpc(message: dict) -> dict:
         return {"tools": [
             {"name": key, "description": descr, "inputSchema": {
                 "type": "object", "properties": props, "required": required, "additionalProperties": False},
-             "annotations": {"readOnlyHint": key in {"discover_printers", "list_printers", "printer_status",
-                                                       "preflight", "job_status"}}}
+             "annotations": {"readOnlyHint": key in READ_ONLY_TOOLS}}
             for key, (descr, props, required, _) in TOOLS.items()
         ]}
     if name == "tools/call":
