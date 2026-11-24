@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+/prints/
+/jobs/
+/profiles/
+*.toml
+*.log
+*.exe
+*.stl
+*.3mf
+*.gcode
+.env
+.env.*
